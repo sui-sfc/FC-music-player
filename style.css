@@ -35,6 +35,8 @@ h2 { margin: 0 0 10px; font-size: 16px; color: var(--muted); letter-spacing: 1px
 .btn.danger { border-color: #7a2030; }
 .btn.small { padding: 4px 10px; }
 .btn.on { background: var(--accent); border-color: #ff6a80; }
+.btn.hq { border-color: #ffb13b; color: #ffe3b0; }
+.btn.hq:hover:not(:disabled) { background: #3b301c; }
 .seek { flex: 1; min-width: 120px; height: 12px; background: #0b0b12; border: 2px solid var(--line); cursor: pointer; }
 #seekbar { height: 100%; width: 0; background: var(--accent); }
 .mono { font-family: Consolas, 'Courier New', monospace; }

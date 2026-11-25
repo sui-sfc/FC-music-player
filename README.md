@@ -228,6 +228,37 @@ node tools/demucs-node.mjs --check   # JS の前後処理が PyTorch と一致�
 - 読み込み時に 1 回空運転して、GPU の初回の遅さで出力の遅れが延びないようにしている
 - ラズパイでは GPU が無いので、Demucs の軽量化 (小さいモデル・量子化) か、AI 用の拡張ボードが必要になる見込み
 
+## 高精度フル曲 MIDI 変換 (GPU フル活用・2 パス一括)
+
+リアルタイム制約 (遅延・計算量の上限) を外し、曲全体を丸ごと解析してから 2 パスで最高精度のファミコン MIDI アレンジを行うモードです (`worklet/midi-arranger.js`, `worklet/midi-export.js`)。
+
+1. **全曲 DP ビート＆小節頭推定**: 曲全体のドラム・立ち上がりから BPM と 4/4 の小節頭を大域最適化
+2. **全曲ビタビ調 (転調含む)・場面判定**: 小節単位で 24 調と「静か / 普通 / サビ」を判定
+3. **7th / sus4 対応の全曲コード進行**: 機能和声 + ベース一致で 72 種のコード進行を大域ビタビ推定
+4. **16 分音符グリッド MIDI 採譜**: 矩形波1 (歌/リード)、矩形波2 (楽器カウンターメロディ / 8分伴奏 / 16分アルペジオ)、三角波 (8分オクターブベース)、ドラム (クラッシュ・オープンハット・8分ハイハット) を離散 MIDI ノート化し、2A03 APU 波形 + `.mid` + 21 バイト/フレーム `.bin` を生成
+
+### ブラウザで使う (WebGPU)
+1. `node server.js` で起動し、**「音源分離 + AI 解析 (Demucs)」** にチェックを入れる (GPU では `htdemucs_ft` が既定)
+2. 音声ファイルを開き、**「★ 高精度フル曲MIDI変換」** をクリック (「一括分離の精度」で `shifts=2 / 4` を選択可能)
+3. 完了すると原音と **遅延 0** で完全同期再生され、**MIDI 保存 (.mid)** / **WAV 保存 (.wav)** / **保存 (.bin)** で書き出せます。分離・AI 解析結果はキャッシュされるため、スライダーを変えて再変換するときは数秒で終わります
+
+### CLI で最高精度を使う (CUDA / DirectML / CoreML GPU)
+
+GPU 搭載 PC では PyTorch (CUDA/MPS) と ONNX Runtime (CUDA/DirectML/CoreML) を自動検出し、1 コマンドで最高精度の音源分離 → AI 採譜 → MIDI 編曲 → 2A03 合成を実行できます。
+
+```bash
+# GPU 最高精度 (htdemucs_ft + overlap 0.5 + shifts 4)
+node tools/hq-arrange.mjs song.mp3 --out hq-out
+
+# 6 ステム分離 (guitar / piano も分離)
+node tools/hq-arrange.mjs song.mp3 --model htdemucs_6s --shifts 4 --out hq-out
+
+# 歌だけ BS-RoFormer で最高精度分離 (要: pip install audio-separator[gpu])
+node tools/hq-arrange.mjs song.mp3 --roformer --out hq-out
+```
+
+`hq-out/` に `chip.wav` (2A03 音声)、`arrangement.mid` (SMF Format 1)、`fc-regs.bin` (21 バイト/フレーム)、`dpcm-c000.bin` ($C000 DPCM バンク)、`summary.json` が出力されます。
+
 ## DPCM ドラム
 
 キック・スネアは DMC チャンネルで短いサンプル (1 ビットデルタ, 約 33.1kHz) を鳴らします (「ドラム」で切替)。

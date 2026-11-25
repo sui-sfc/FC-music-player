@@ -12,8 +12,19 @@ let session = null;
 export async function loadRmvpe(modelPath = MODEL_PATH) {
   if (session) return session;
   const ort = require('onnxruntime-node');
-  session = await ort.InferenceSession.create(modelPath, { graphOptimizationLevel: 'all' });
-  session.ort = ort;
+  for (const ep of ['cuda', 'dml', 'coreml', 'cpu']) {
+    try {
+      session = await ort.InferenceSession.create(modelPath, { executionProviders: [ep], graphOptimizationLevel: 'all' });
+      session.ort = ort;
+      session.ep = ep;
+      break;
+    } catch {}
+  }
+  if (!session) {
+    session = await ort.InferenceSession.create(modelPath, { graphOptimizationLevel: 'all' });
+    session.ort = ort;
+    session.ep = 'cpu';
+  }
   return session;
 }
 

@@ -23,6 +23,7 @@
       <button id="demoVocal" class="btn">テスト音源(歌)</button>
       <button id="mic" class="btn">マイク</button>
       <button id="tab" class="btn">タブ/システム音声</button>
+      <button id="hqRun" class="btn hq" disabled>★ 高精度フル曲MIDI変換</button>
       <button id="stop" class="btn danger">停止</button>
     </div>
     <div class="row">
@@ -71,6 +72,7 @@
       <label><input id="rmvpe" type="checkbox"> AI 解析 (RMVPE + Basic Pitch) <span id="rmvpeStatus" class="note"></span></label>
       <label><input id="demucs" type="checkbox"> 音源分離 + AI 解析 (Demucs, 数秒遅れる) <span id="demucsStatus" class="note"></span></label>
       <label>分離モデル <select id="demucsModel"><option value="ft" selected>高精度 (htdemucs_ft, GPU 向け, 約 5 秒遅れ)</option><option value="htdemucs">標準 (htdemucs, 約 4 秒遅れ)</option></select></label>
+      <label>一括分離の精度 (フル曲変換時) <select id="hqShifts"><option value="1">標準 (overlap 50%, shifts 1)</option><option value="2" selected>高精度 (overlap 50%, shifts 2)</option><option value="4">最高精度 (overlap 50%, shifts 4)</option></select></label>
       <label><input id="vocal" type="checkbox" checked> ボーカルモード (中央の声をメロディに)</label>
       <label>先読み <input id="lookahead" type="range" min="0" max="120" step="1" value="30"></label>
       <label>発声しきい値 <input id="voiceThr" type="range" min="0.02" max="0.5" step="0.01" value="0.2"></label>
@@ -139,11 +141,17 @@
       <label>ドラム音量 <input id="drumVol" type="range" min="0" max="1.5" step="0.05" value="1"></label>
     </div>
     <div>
-      <h2>レジスタログ</h2>
-      <p class="note">実機移植用に APU レジスタ書き込みを 1 フレーム 21 バイトで記録します。DPCM ドラムを使う場合は、サンプルのバンクもカートリッジの $C000 に置きます。</p>
-      <button id="rec" class="btn">● 記録開始</button>
-      <button id="save" class="btn" disabled>保存 (.bin)</button>
-      <button id="saveDpcm" class="btn">DPCM バンク保存</button>
+      <h2>書き出し / レジスタログ</h2>
+      <p class="note">実機移植用に APU レジスタ書き込みを 1 フレーム 21 バイトで記録します。DPCM ドラムを使う場合は、サンプルのバンクもカートリッジの $C000 に置きます。フル曲変換後は MIDI (.mid) / WAV (.wav) / レジスタ (.bin) をそのまま保存できます。</p>
+      <div class="row">
+        <button id="saveMidi" class="btn" disabled>MIDI 保存 (.mid)</button>
+        <button id="saveWav" class="btn" disabled>WAV 保存 (.wav)</button>
+      </div>
+      <div class="row">
+        <button id="rec" class="btn">● 記録開始</button>
+        <button id="save" class="btn" disabled>保存 (.bin)</button>
+        <button id="saveDpcm" class="btn">DPCM バンク保存</button>
+      </div>
       <div id="recInfo" class="mono note"></div>
     </div>
   </section>

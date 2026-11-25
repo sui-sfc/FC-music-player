@@ -1,4 +1,6 @@
 import { buildDrumBank } from './worklet/dpcm.js';
+import { arrangeFullSong } from './worklet/midi-arranger.js';
+import { exportMidi } from './worklet/midi-export.js';
 // メインスレッド: 入力ソースの管理, UI, 可視化, レジスタログ記録
 const $ = (id) => document.getElementById(id);
 const NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
@@ -7,7 +9,11 @@ const noteName = (n) => (n < 0 ? '--' : NOTE_NAMES[n % 12] + (Math.floor(n / 12)
 let ctx, fcNode, bus, chipGain, origGain, delay;
 let sepDelay = 0; // 音源分離モードの出力の遅れ (秒)
 let source = null; // { kind, node, stop() }
-let fileBuf = null, fileStart = 0, fileOffset = 0, filePlaying = false, fileSrc = null;
+let fileBuf = null, fileLabel = '', fileStart = 0, fileOffset = 0, filePlaying = false, fileSrc = null;
+
+// フル曲・高精度 MIDI 変換モードの状態
+let hqMode = false, hqResult = null, hqAudioBuf = null, hqCache = null;
+let hqChipSrc = null, hqOrigSrc = null, hqFrameIdx = -1, hqBusy = false;
 
 async function ensureAudio() {
   if (ctx) { if (ctx.state === 'suspended') await ctx.resume(); return; }
@@ -38,9 +44,20 @@ function updateDelay() {
   delay.delayTime.value = (ctx.sampleRate > 60000 ? 8192 : 4096) / ctx.sampleRate + +$('lookahead').value / 60.0988 + sepDelay;
 }
 
-function stopSource() {
-  if (fileSrc) { fileSrc.onended = null; try { fileSrc.stop(); } catch {} fileSrc.disconnect(); fileSrc = null; }
+function stopAudioNodes() {
+  for (const n of [fileSrc, hqChipSrc, hqOrigSrc]) {
+    if (!n) continue;
+    n.onended = null;
+    try { n.stop(); } catch {}
+    try { n.disconnect(); } catch {}
+  }
+  fileSrc = null; hqChipSrc = null; hqOrigSrc = null;
   filePlaying = false;
+}
+
+function stopSource() {
+  stopAudioNodes();
+  fileOffset = 0;
   if (source && source.stop) source.stop();
   source = null;
   $('play').textContent = '▶';
@@ -49,7 +66,25 @@ function stopSource() {
 
 // ---------------- ファイル再生 ----------------
 function playFile(offset) {
-  if (fileSrc) { fileSrc.onended = null; try { fileSrc.stop(); } catch {} fileSrc.disconnect(); }
+  stopAudioNodes();
+  if (hqMode && hqAudioBuf) {
+    // フル曲変換済み: 2A03 音声と原音を遅延 0 で完全同期再生
+    hqChipSrc = ctx.createBufferSource();
+    hqChipSrc.buffer = hqAudioBuf;
+    hqChipSrc.connect(chipGain);
+    hqOrigSrc = ctx.createBufferSource();
+    hqOrigSrc.buffer = fileBuf;
+    hqOrigSrc.connect(origGain);
+    const t0 = ctx.currentTime + 0.02;
+    hqChipSrc.onended = () => { filePlaying = false; fileOffset = 0; $('play').textContent = '▶'; };
+    hqChipSrc.start(t0, offset);
+    hqOrigSrc.start(t0, offset);
+    fileStart = t0 - offset;
+    filePlaying = true;
+    hqFrameIdx = -1;
+    $('play').textContent = '❚❚';
+    return;
+  }
   fileSrc = ctx.createBufferSource();
   fileSrc.buffer = fileBuf;
   fileSrc.connect(bus);
@@ -61,17 +96,23 @@ function playFile(offset) {
 }
 function pauseFile() {
   if (!filePlaying) return;
-  fileOffset = ctx.currentTime - fileStart;
-  fileSrc.onended = null;
-  fileSrc.stop(); fileSrc.disconnect(); fileSrc = null;
-  filePlaying = false;
+  fileOffset = Math.max(0, ctx.currentTime - fileStart);
+  stopAudioNodes();
   $('play').textContent = '▶';
+}
+function updateExportButtons() {
+  $('saveMidi').disabled = !hqResult;
+  $('saveWav').disabled = !hqResult;
+  $('save').disabled = recording || (!recFrames.length && !hqResult);
 }
 async function loadBuffer(buf, label) {
   stopSource();
-  fileBuf = buf; fileOffset = 0;
+  hqMode = false; hqResult = null; hqAudioBuf = null; hqCache = null; hqFrameIdx = -1;
+  fileBuf = buf; fileLabel = label; fileOffset = 0;
   source = { kind: 'file' };
   $('play').disabled = false;
+  $('hqRun').disabled = false;
+  updateExportButtons();
   if (origGain && +$('origVol').value === 0) { /* 原音はユーザーが上げたときだけ */ }
   setStatus(`${label} (${fmt(buf.duration)})`);
   playFile(0);
@@ -131,7 +172,9 @@ $('seek').addEventListener('click', (e) => {
 // ---------------- マイク / タブ音声 ----------------
 async function useStream(stream, kind, label) {
   stopSource();
-  fileBuf = null; $('play').disabled = true;
+  hqMode = false; hqResult = null; hqAudioBuf = null; hqCache = null; hqFrameIdx = -1;
+  fileBuf = null; $('play').disabled = true; $('hqRun').disabled = true;
+  updateExportButtons();
   const node = ctx.createMediaStreamSource(stream);
   node.connect(bus);
   source = {
@@ -181,37 +224,39 @@ function applyVolumes() {
 $('chipVol').addEventListener('input', applyVolumes);
 $('origVol').addEventListener('input', applyVolumes);
 
+function getParams() {
+  const mute = [0, 1, 2, 3].map((c) => !document.querySelector(`.mute[data-ch="${c}"]`).checked);
+  return {
+    midiMode: $('midiMode').checked,
+    duty1: +$('duty1').value, duty2: +$('duty2').value, bassOctave: +$('bassOctave').value, bassPattern: $('bassPattern').value,
+    mute, p2mode: $('p2mode').value, arpSpeed: +$('arpSpeed').value, arpRate: $('arpRate').value, arpPattern: $('arpPattern').value,
+    attackBend: +$('attackBend').value, dutyEnv: $('dutyEnv').value, release: +$('release').value, harmVol: +$('harmVol').value, instCost: +$('instCost').value, kickTri: $('kickTri').checked, drumMode: $('drumMode').value,
+    melOctave: $('melOctave').value, melQuant: $('melQuant').checked, lead: $('lead').checked,
+    pitchMode: $('pitchMode').value, accent: +$('accent').value, decay: +$('decay').value, chordCost: +$('chordCost').value, bassCost: +$('bassCost').value,
+    hold: +$('hold').value, vocal: $('vocal').checked, voiceThr: +$('voiceThr').value, lookahead: +$('lookahead').value, noteCost: +$('noteCost').value, sens: +$('sens').value, drumSens: +$('drumSens').value, drumVol: +$('drumVol').value,
+  };
+}
 function sendParams() {
   if (!fcNode) return;
   updateDelay();
-  const mute = [0, 1, 2, 3].map((c) => !document.querySelector(`.mute[data-ch="${c}"]`).checked);
-  fcNode.port.postMessage({
-    type: 'params',
-    params: {
-      midiMode: $('midiMode').checked,
-      duty1: +$('duty1').value, duty2: +$('duty2').value, bassOctave: +$('bassOctave').value, bassPattern: $('bassPattern').value,
-      mute, p2mode: $('p2mode').value, arpSpeed: +$('arpSpeed').value, arpRate: $('arpRate').value, arpPattern: $('arpPattern').value,
-      attackBend: +$('attackBend').value, dutyEnv: $('dutyEnv').value, release: +$('release').value, harmVol: +$('harmVol').value, instCost: +$('instCost').value, kickTri: $('kickTri').checked, drumMode: $('drumMode').value,
-      melOctave: $('melOctave').value, melQuant: $('melQuant').checked, lead: $('lead').checked,
-      pitchMode: $('pitchMode').value, accent: +$('accent').value, decay: +$('decay').value, chordCost: +$('chordCost').value, bassCost: +$('bassCost').value,
-      hold: +$('hold').value, vocal: $('vocal').checked, voiceThr: +$('voiceThr').value, lookahead: +$('lookahead').value, noteCost: +$('noteCost').value, sens: +$('sens').value, drumSens: +$('drumSens').value, drumVol: +$('drumVol').value,
-    },
-  });
+  fcNode.port.postMessage({ type: 'params', params: getParams() });
 }
 document.querySelectorAll('.grid input, .grid select').forEach((el) => {
-  if (el.id !== 'chipVol' && el.id !== 'origVol') el.addEventListener('input', sendParams);
+  if (el.id !== 'chipVol' && el.id !== 'origVol' && el.id !== 'hqShifts') el.addEventListener('input', sendParams);
 });
 
 // ---------------- AI 解析 (RMVPE + Basic Pitch) ----------------
 // モデルは Web Worker で動かし、AudioWorklet と MessagePort で直結する
 // (16kHz 音声の窓 → Worker → 音程 → AudioWorklet。メインスレッドは経由しない)
-let rmvpeWorker = null;
+let rmvpeWorker = null, rmvpeReadyP = null, rmvpeFullPend = null;
 const rmvpeStatus = (s) => { $('rmvpeStatus').textContent = s; };
 async function startRmvpe() {
   await ensureAudio();
   rmvpeStatus('読み込み中…');
   const w = new Worker('rmvpe-worker.js', { type: 'module' });
   rmvpeWorker = w;
+  let resReady, rejReady;
+  rmvpeReadyP = new Promise((res, rej) => { resReady = res; rejReady = rej; });
   w.onmessage = (e) => {
     const m = e.data;
     if (w !== rmvpeWorker) return;
@@ -224,21 +269,34 @@ async function startRmvpe() {
       rmvpeStatus(`ON (${m.threads} スレッド)`);
       // 推論窓の端 (未来の文脈が少ない部分) を使わずに済むよう、先読みを 1 秒以上にする
       if (+$('lookahead').value < 60) { $('lookahead').value = 60; sendParams(); }
+      resReady && resReady(m); resReady = null;
+    } else if (m.type === 'fullProgress') {
+      rmvpeFullPend?.onProgress?.(m.p, m.label);
+    } else if (m.type === 'fullResult') {
+      const p = rmvpeFullPend; rmvpeFullPend = null; p?.resolve(m);
     } else if (m.type === 'stat') {
       rmvpeStatus(`ON: ${m.sec} 秒を ${m.ms.toFixed(0)}ms で推論`);
     } else if (m.type === 'debug') {
       (window.fcPitch ||= []).push(m);
     } else if (m.type === 'error') {
       rmvpeStatus('エラー: ' + m.message);
+      rejReady && rejReady(new Error(m.message)); rejReady = null;
+      const p = rmvpeFullPend; rmvpeFullPend = null; p?.reject(new Error(m.message));
     }
   };
-  w.onerror = (e) => rmvpeStatus('エラー: ' + (e.message || 'Worker を起動できません'));
+  w.onerror = (e) => {
+    const msg = e.message || 'Worker を起動できません';
+    rmvpeStatus('エラー: ' + msg);
+    rejReady && rejReady(new Error(msg)); rejReady = null;
+    const p = rmvpeFullPend; rmvpeFullPend = null; p?.reject(new Error(msg));
+  };
   w.postMessage({ type: 'load', url: 'models/rmvpe.onnx' });
 }
 function stopRmvpe() {
   if (fcNode) fcNode.port.postMessage({ type: 'aiOff' });
   if (rmvpeWorker) rmvpeWorker.terminate();
-  rmvpeWorker = null;
+  rmvpeWorker = null; rmvpeReadyP = null;
+  if (rmvpeFullPend) { rmvpeFullPend.reject(new Error('AI 解析が停止されました')); rmvpeFullPend = null; }
   rmvpeStatus('');
 }
 $('rmvpe').addEventListener('change', (e) => {
@@ -248,7 +306,7 @@ $('rmvpe').addEventListener('change', (e) => {
 
 // ---------------- 音源分離 (Demucs) + AI 解析 ----------------
 // 曲を 歌・ベース・ドラム・その他 に分けてから解析する。分離を待つぶん出力は数秒遅れる
-let demucsWorker = null, sepTimer = 0;
+let demucsWorker = null, demucsReadyP = null, demucsFullPend = null, sepTimer = 0;
 const sepStatus = (s) => { $('demucsStatus').textContent = s; };
 let sepInfo = '';
 async function startDemucs() {
@@ -256,6 +314,8 @@ async function startDemucs() {
   sepStatus('読み込み中…');
   const w = new Worker('demucs-worker.js', { type: 'module' });
   demucsWorker = w;
+  let resReady, rejReady;
+  demucsReadyP = new Promise((res, rej) => { resReady = res; rejReady = rej; });
   w.onmessage = (e) => {
     const m = e.data;
     if (w !== demucsWorker) return;
@@ -273,13 +333,25 @@ async function startDemucs() {
       sendParams();
       clearInterval(sepTimer);
       sepTimer = setInterval(() => fcNode && fcNode.port.postMessage({ type: 'stemStat' }), 1000);
+      resReady && resReady(m); resReady = null;
+    } else if (m.type === 'fullProgress') {
+      demucsFullPend?.onProgress?.(m.p, m.label);
+    } else if (m.type === 'fullResult') {
+      const p = demucsFullPend; demucsFullPend = null; p?.resolve(m);
     } else if (m.type === 'stat') {
       window.fcSepStat = m;
     } else if (m.type === 'error') {
       sepStatus('エラー: ' + m.message);
+      rejReady && rejReady(new Error(m.message)); rejReady = null;
+      const p = demucsFullPend; demucsFullPend = null; p?.reject(new Error(m.message));
     }
   };
-  w.onerror = (e) => sepStatus('エラー: ' + (e.message || 'Worker を起動できません'));
+  w.onerror = (e) => {
+    const msg = e.message || 'Worker を起動できません';
+    sepStatus('エラー: ' + msg);
+    rejReady && rejReady(new Error(msg)); rejReady = null;
+    const p = demucsFullPend; demucsFullPend = null; p?.reject(new Error(msg));
+  };
   w.postMessage({ type: 'load', model: $('demucsModel').value });
 }
 function onStemStat(m) {
@@ -292,7 +364,8 @@ function stopDemucs() {
   clearInterval(sepTimer);
   if (fcNode) fcNode.port.postMessage({ type: 'stemOff' });
   if (demucsWorker) demucsWorker.terminate();
-  demucsWorker = null;
+  demucsWorker = null; demucsReadyP = null;
+  if (demucsFullPend) { demucsFullPend.reject(new Error('音源分離が停止されました')); demucsFullPend = null; }
   sepDelay = 0;
   updateDelay();
   sepStatus('');
@@ -303,7 +376,98 @@ $('demucs').addEventListener('change', (e) => {
   e.target.checked ? startDemucs() : stopDemucs();
 });
 
-// ---------------- レジスタログ ----------------
+// ---------------- 高精度フル曲 MIDI 変換 (2 パス一括 + GPU) ----------------
+async function runHqArrange() {
+  if (!fileBuf || hqBusy) return;
+  await ensureAudio();
+  hqBusy = true;
+  $('hqRun').disabled = true;
+  pauseFile();
+  fcNode && fcNode.port.postMessage({ type: 'reset' });
+
+  const sr = fileBuf.sampleRate;
+  const L = fileBuf.getChannelData(0);
+  const R = fileBuf.numberOfChannels > 1 ? fileBuf.getChannelData(1) : L;
+  const mode = $('demucs').checked ? 'demucs' : $('rmvpe').checked ? 'rmvpe' : 'builtin';
+  const model = $('demucsModel').value;
+  const shifts = +$('hqShifts').value;
+  const t0 = performance.now();
+
+  try {
+    let stems = null, rmvpe = null, bassRmvpe = null, bp = null;
+    const hit = hqCache && hqCache.buf === fileBuf && hqCache.mode === mode &&
+      (mode !== 'demucs' || (hqCache.model === model && hqCache.shifts === shifts));
+
+    if (hit) {
+      ({ stems, rmvpe, bassRmvpe, bp } = hqCache);
+      setStatus('キャッシュ済みの分離・AI 解析結果を使って再アレンジ中…');
+    } else if (mode === 'demucs') {
+      if (!demucsWorker) startDemucs();
+      setStatus('音源分離モデルの準備完了を待機中…');
+      await demucsReadyP;
+      const lCopy = L.slice(), rCopy = R.slice();
+      const res = await new Promise((resolve, reject) => {
+        demucsFullPend = {
+          resolve, reject,
+          onProgress: (p, label) => setStatus(`★ フル曲変換 (${Math.round(p * 100)}%): ${label}`),
+        };
+        demucsWorker.postMessage({ type: 'fullSong', L: lCopy, R: rCopy, sr, overlap: 0.5, shifts }, [lCopy.buffer, rCopy.buffer]);
+      });
+      stems = { vL: res.vL, vR: res.vR, d: res.d };
+      rmvpe = res.rm; bassRmvpe = res.bf; bp = res.bp;
+      hqCache = { buf: fileBuf, mode, model, shifts, stems, rmvpe, bassRmvpe, bp };
+    } else if (mode === 'rmvpe') {
+      if (!rmvpeWorker) startRmvpe();
+      setStatus('AI モデルの準備完了を待機中…');
+      await rmvpeReadyP;
+      const lCopy = L.slice(), rCopy = R.slice();
+      const res = await new Promise((resolve, reject) => {
+        rmvpeFullPend = {
+          resolve, reject,
+          onProgress: (p, label) => setStatus(`★ フル曲変換 (${Math.round(p * 100)}%): ${label}`),
+        };
+        rmvpeWorker.postMessage({ type: 'fullSong', L: lCopy, R: rCopy, sr }, [lCopy.buffer, rCopy.buffer]);
+      });
+      rmvpe = res.rm; bp = res.bp;
+      hqCache = { buf: fileBuf, mode, model, shifts, stems, rmvpe, bassRmvpe, bp };
+    } else {
+      hqCache = { buf: fileBuf, mode, model, shifts, stems, rmvpe, bassRmvpe, bp };
+    }
+
+    setStatus('★ 全曲ビート・キー・7thコード・16分MIDI編曲＆2A03合成中…');
+    await new Promise((r) => setTimeout(r, 20));
+    const res = arrangeFullSong({
+      sr, L, R, stems, rmvpe, bassRmvpe, bp,
+      params: getParams(),
+      onProgress: (p, label) => { $('status').textContent = `★ MIDI 編曲 (${Math.round(p * 100)}%): ${label}`; },
+    });
+
+    const outBuf = ctx.createBuffer(2, res.pcm.length, sr);
+    outBuf.getChannelData(0).set(res.pcm);
+    outBuf.getChannelData(1).set(res.pcm);
+    hqResult = res;
+    hqAudioBuf = outBuf;
+    hqMode = true;
+    hqFrameIdx = -1;
+    waiting = []; pending = [];
+    g.fillStyle = '#07070c'; g.fillRect(0, 0, roll.width, roll.height);
+    updateExportButtons();
+
+    const sec = ((performance.now() - t0) / 1000).toFixed(1);
+    const modeTag = mode === 'demucs' ? `GPU分離 ${model} shifts=${shifts}` : mode === 'rmvpe' ? 'AI解析' : '内蔵解析';
+    setStatus(`★ フル曲MIDI完了 (${sec}s, ${modeTag}): ${fileLabel} | Key=${res.keyName} | BPM=${res.bpm.toFixed(1)} | ${res.numBars}小節 (原音と遅延0同期)`);
+    $('recInfo').textContent = `フル曲変換済み: ${res.frames.length} フレーム (${(res.frames.length / 60.1).toFixed(1)} 秒) — MIDI / WAV / .bin 保存可`;
+    playFile(0);
+  } catch (err) {
+    setStatus('フル曲変換エラー: ' + (err.message || err));
+  } finally {
+    hqBusy = false;
+    $('hqRun').disabled = !fileBuf;
+  }
+}
+$('hqRun').addEventListener('click', runHqArrange);
+
+// ---------------- 書き出し / レジスタログ ----------------
 // 1 フレーム = $4000-$4013 の 20 バイト + 書き込みマスク 1 バイト (README 参照)
 const FRAME_BYTES = 21;
 function download(name, data) {
@@ -313,6 +477,29 @@ function download(name, data) {
   a.click();
   setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
+function encodeWav16(samples, sr) {
+  const n = samples.length, buf = new ArrayBuffer(44 + n * 2), dv = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) dv.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); str(8, 'WAVE');
+  str(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  str(36, 'data'); dv.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    dv.setInt16(44 + i * 2, s < 0 ? s * 32768 : s * 32767, true);
+  }
+  return new Uint8Array(buf);
+}
+const baseFileName = () => (fileLabel || 'fc-arrangement').replace(/\.[^/.]+$/, '').replace(/[\\/:*?"<>|]/g, '_');
+
+$('saveMidi').addEventListener('click', () => {
+  if (!hqResult) return;
+  download(`${baseFileName()}.mid`, exportMidi(hqResult));
+});
+$('saveWav').addEventListener('click', () => {
+  if (!hqResult || !fileBuf) return;
+  download(`${baseFileName()}-fc.wav`, encodeWav16(hqResult.pcm, fileBuf.sampleRate));
+});
 // DPCM サンプルのバンク ($C000-$FFFF に置く 16KB)。実機ではカートリッジ側に置く
 $('saveDpcm').addEventListener('click', () => download('dpcm-c000.bin', buildDrumBank().bank));
 let recording = false, recFrames = [];
@@ -321,12 +508,16 @@ $('rec').addEventListener('click', () => {
   if (recording) recFrames = [];
   $('rec').textContent = recording ? '■ 記録停止' : '● 記録開始';
   $('rec').classList.toggle('on', recording);
-  $('save').disabled = recording || !recFrames.length;
+  updateExportButtons();
 });
 $('save').addEventListener('click', () => {
-  const data = new Uint8Array(recFrames.length * FRAME_BYTES);
-  recFrames.forEach((f, i) => data.set(f, i * FRAME_BYTES));
-  download('fc-regs.bin', data);
+  if (recFrames.length) {
+    const data = new Uint8Array(recFrames.length * FRAME_BYTES);
+    recFrames.forEach((f, i) => data.set(f, i * FRAME_BYTES));
+    download('fc-regs.bin', data);
+  } else if (hqResult) {
+    download(`${baseFileName()}-regs.bin`, hqResult.regLog);
+  }
 });
 
 // ---------------- 可視化 ----------------
@@ -339,6 +530,7 @@ let lastInfo = null;
 
 function onFrame(info) {
   if (info.type === 'stemStat') return onStemStat(info);
+  if (hqMode) return;
   if (recording) {
     const f = new Uint8Array(FRAME_BYTES);
     f.set(info.regs, 0); // $4000-$4013
@@ -353,8 +545,24 @@ function onFrame(info) {
 }
 
 function draw() {
-  // 音が出た (スピーカーに届いた) フレームだけを表示に回す
-  if (ctx && waiting.length) {
+  if (hqMode && hqResult && ctx) {
+    // フル曲変換モード: 再生位置に合わせて変換済みフレームを厳密に同期描画
+    const lat = filePlaying ? (ctx.outputLatency || ctx.baseLatency || 0) : 0;
+    const t = Math.max(0, (filePlaying ? ctx.currentTime - fileStart : fileOffset) - lat);
+    const fi = Math.max(0, Math.min(hqResult.frames.length - 1, Math.floor(t * 60.0988)));
+    if (fi !== hqFrameIdx) {
+      if (fi < hqFrameIdx || fi - hqFrameIdx > 300) {
+        g.fillStyle = '#07070c'; g.fillRect(0, 0, roll.width, roll.height);
+        const start = Math.max(0, fi - Math.floor(roll.width / 2) + 1);
+        for (let k = start; k <= fi; k++) pending.push(hqResult.frames[k]);
+      } else {
+        for (let k = hqFrameIdx + 1; k <= fi; k++) pending.push(hqResult.frames[k]);
+      }
+      lastInfo = hqResult.frames[fi];
+      hqFrameIdx = fi;
+    }
+  } else if (ctx && waiting.length) {
+    // 音が出た (スピーカーに届いた) フレームだけを表示に回す
     const now = ctx.currentTime - (ctx.outputLatency || ctx.baseLatency || 0);
     let k = 0;
     while (k < waiting.length && !(waiting[k].at > now)) k++;
@@ -423,7 +631,7 @@ function draw() {
   else if (recFrames.length) $('recInfo').textContent = `記録済み: ${recFrames.length} フレーム`;
 
   if (fileBuf) {
-    const t = filePlaying ? ctx.currentTime - fileStart : fileOffset;
+    const t = Math.max(0, filePlaying ? ctx.currentTime - fileStart : fileOffset);
     $('seekbar').style.width = Math.min(100, (t / fileBuf.duration) * 100) + '%';
     $('time').textContent = `${fmt(t)} / ${fmt(fileBuf.duration)}`;
   } else $('time').textContent = '--:--';
