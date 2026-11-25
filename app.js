@@ -188,6 +188,7 @@ function sendParams() {
   fcNode.port.postMessage({
     type: 'params',
     params: {
+      midiMode: $('midiMode').checked,
       duty1: +$('duty1').value, duty2: +$('duty2').value, bassOctave: +$('bassOctave').value, bassPattern: $('bassPattern').value,
       mute, p2mode: $('p2mode').value, arpSpeed: +$('arpSpeed').value, arpRate: $('arpRate').value, arpPattern: $('arpPattern').value,
       attackBend: +$('attackBend').value, dutyEnv: $('dutyEnv').value, release: +$('release').value, harmVol: +$('harmVol').value, instCost: +$('instCost').value, kickTri: $('kickTri').checked, drumMode: $('drumMode').value,
@@ -403,6 +404,7 @@ function draw() {
     $('n2').textContent = f.tri.note === -2 ? 'KICK' : noteName(f.tri.note);
     $('n3').textContent = f.noise.vol ? f.noise.drum.toUpperCase() : '--';
     $('chord').textContent = f.chord && f.chord !== 'N' ? f.chord : '--';
+    $('key').textContent = f.key || '--';
     $('bpm').textContent = f.bpm ? Math.round(f.bpm) : '--';
     $('section').textContent = ['静か', '普通', 'サビ'][f.energy] ?? '--';
     $('m0').style.setProperty('--v', (f.p1.vol / 15) * 100 + '%');

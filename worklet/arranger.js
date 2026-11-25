@@ -117,12 +117,102 @@ export class EnergyTracker {
     this.hits = hits;
     let want = 1;
     if (this.db < P.quietDb || hits < 3) want = 0;
-    else if (this.n > 1800 && this.vdb > P.loudDb) want = 2;
+    else if (this.n > 720 && this.vdb > P.loudDb) want = 2;
     if (want === this.level) { this.cand = want; this.candAge = 0; }
-    // サビから抜けるのは 4 秒、それ以外は 2 秒続いたら切り替える (サビの中の息継ぎで抜けないように)
-    else if (want === this.cand) { if (++this.candAge > (this.level === 2 ? 240 : 120)) { this.level = want; this.candAge = 0; } }
+    // サビから抜けるのは 4 秒、それ以外は 1.5 秒続いたら切り替える (サビの中の息継ぎで抜けないように)
+    else if (want === this.cand) { if (++this.candAge > (this.level === 2 ? 240 : 90)) { this.level = want; this.candAge = 0; } }
     else { this.cand = want; this.candAge = 0; }
     return this.level;
+  }
+}
+
+// ---------------- 調 (キー / スケール) ----------------
+// クロマ履歴を Krumhansl-Schmuckler プロファイルと照合して長調/短調 24 種を推定する。
+// 音程・コード認識に穏やかなスケール内バイアスをかけ、MIDI 打ち込みらしい破綻の少ない音選びにする
+const KEY_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B'];
+const KS_MAJ = [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88];
+const KS_MIN = [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17];
+function normProfile(p) {
+  const m = p.reduce((a, b) => a + b, 0) / 12;
+  const d = p.map((v) => v - m);
+  const s = Math.hypot(...d) || 1;
+  return d.map((v) => v / s);
+}
+const PROF_MAJ = normProfile(KS_MAJ);
+const PROF_MIN = normProfile(KS_MIN);
+const SCALE_MAJ = new Set([0, 2, 4, 5, 7, 9, 11]);
+const SCALE_MIN = new Set([0, 2, 3, 5, 7, 8, 10, 11]); // 導音 (+11) も許容
+// 調ごとのダイアトニックコード (相対ルートと種別 0=maj, 1=min, 2=5)
+const DIA_MAJ = [
+  [0, 0], [2, 1], [4, 1], [5, 0], [7, 0], [9, 1],
+  [0, 2], [2, 2], [4, 2], [5, 2], [7, 2], [9, 2],
+];
+const DIA_MIN = [
+  [0, 1], [3, 0], [5, 1], [7, 1], [7, 0], [8, 0], [10, 0],
+  [0, 2], [3, 2], [5, 2], [7, 2], [8, 2], [10, 2],
+];
+
+export class KeyTracker {
+  constructor() {
+    this.hist = new Float64Array(12);
+    this.n = 0;
+    this.root = -1; // 0..11 (-1 = 不明)
+    this.minor = false;
+    this.conf = 0; // 0..1
+    this.cand = -1;
+    this.candAge = 0;
+  }
+  push(chroma, total) {
+    if (!chroma || total <= 0.1) return;
+    // 約 20 秒の指数減衰 (セクション内は安定しつつ、ラスサビの転調にも追従できる)
+    const decay = 0.9992;
+    for (let i = 0; i < 12; i++) this.hist[i] = this.hist[i] * decay + chroma[i] / total;
+    this.n++;
+    if (this.n >= 90 && this.n % 15 === 0) this._estimate();
+  }
+  _estimate() {
+    let mean = 0;
+    for (let i = 0; i < 12; i++) mean += this.hist[i];
+    mean /= 12;
+    let norm = 0;
+    const h = new Float64Array(12);
+    for (let i = 0; i < 12; i++) { h[i] = this.hist[i] - mean; norm += h[i] * h[i]; }
+    norm = Math.sqrt(norm);
+    if (norm < 1e-6) return;
+    let best = -1, bestS = -Infinity, secondS = -Infinity;
+    for (let k = 0; k < 24; k++) {
+      const r = k % 12, prof = k < 12 ? PROF_MAJ : PROF_MIN;
+      let dot = 0;
+      for (let i = 0; i < 12; i++) dot += h[(r + i) % 12] * prof[i];
+      const sc = dot / norm;
+      if (sc > bestS) { secondS = bestS; bestS = sc; best = k; }
+      else if (sc > secondS) secondS = sc;
+    }
+    const c = Math.max(0, Math.min(1, (bestS - 0.35) / 0.45));
+    if (c < 0.15) return;
+    const cur = this.root < 0 ? -1 : this.root + (this.minor ? 12 : 0);
+    if (cur < 0 || best === cur) {
+      this.root = best % 12; this.minor = best >= 12; this.conf = c; this.cand = best; this.candAge = 0;
+    } else if (best === this.cand) {
+      if (++this.candAge >= 8) { this.root = best % 12; this.minor = best >= 12; this.conf = c; this.candAge = 0; }
+    } else { this.cand = best; this.candAge = 1; }
+  }
+  get keyName() { return this.root < 0 ? '--' : KEY_NAMES[this.root] + (this.minor ? 'm' : ''); }
+  // MIDI ノートが推定スケール内かどうかの穏やかな対数スコア補正
+  noteBias(midi) {
+    if (this.root < 0 || this.conf < 0.2) return 0;
+    const pc = ((Math.round(midi) - this.root) % 12 + 12) % 12;
+    const sc = this.minor ? SCALE_MIN : SCALE_MAJ;
+    if (pc === 0 || pc === 7) return 0.35 * this.conf;
+    return (sc.has(pc) ? 0.2 : -0.4) * this.conf;
+  }
+  // コード ID (0..35) がダイアトニックコードかどうかのスコア補正
+  chordBias(chordId) {
+    if (this.root < 0 || this.conf < 0.2 || chordId < 0 || chordId >= 36) return 0;
+    const type = Math.floor(chordId / 12), r = ((chordId % 12) - this.root + 12) % 12;
+    const list = this.minor ? DIA_MIN : DIA_MAJ;
+    for (const [dr, dt] of list) if (dr === r && dt === type) return 0.65 * this.conf;
+    return -0.25 * this.conf;
   }
 }
 
@@ -132,9 +222,10 @@ export const ARP_PATTERNS = {
   down: [2, 1, 0],
   updown: [0, 1, 2, 1], // 1-3-5-3
   up8: [0, 1, 2, 3], // 1-3-5-8
+  '1535': [0, 2, 1, 2], // 1-5-3-5 (MIDI 伴奏定番のアルベルティ型)
 };
 // tones: 構成音 (低い順, 3 音以上), beat: 今が何拍目か (null = テンポ不明), frame: フレーム番号
-// rate: 'frame' (arpSpeed フレームごと) / '16' / '32'
+// rate: 'frame' (arpSpeed フレームごと) / '8' / '16' / '32'
 // 戻り値: { note, age (この音になってからの割合 0..1) }
 export function arpTone(tones, pattern, rate, beat, frame, arpSpeed) {
   const pat = ARP_PATTERNS[pattern] || ARP_PATTERNS.up;
@@ -144,7 +235,7 @@ export function arpTone(tones, pattern, rate, beat, frame, arpSpeed) {
   if (rate === 'frame' || beat === null) {
     step = Math.floor(frame / arpSpeed); age = 0;
   } else {
-    const div = rate === '32' ? 8 : 4;
+    const div = rate === '32' ? 8 : rate === '8' ? 2 : 4;
     const x = beat * div;
     step = Math.floor(x); age = x - step;
   }
