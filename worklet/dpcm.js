@@ -43,14 +43,15 @@ function rng(seed) {
 }
 
 function synthKick(fs) {
-  const n = Math.round(fs * 0.2), w = new Float32Array(n);
+  const n = Math.round(fs * 0.2), w = new Float32Array(n), rnd = rng(67890);
   let ph = 0;
   for (let i = 0; i < n; i++) {
     const t = i / fs;
-    const f = 48 + 140 * Math.exp(-t / 0.025); // 高い所から急に下がる
+    const f = 48 + 145 * Math.exp(-t / 0.022); // 高い所から急に下がる
     ph += (2 * Math.PI * f) / fs;
-    const env = Math.exp(-t / 0.09) * Math.min(1, t / 0.002);
-    w[i] = DPCM_START_LEVEL + 46 * env * Math.sin(ph);
+    const env = Math.exp(-t / 0.085) * Math.min(1, t / 0.0015);
+    const click = t < 0.004 ? rnd() * 14 * Math.exp(-t / 0.0015) : 0; // ビーターのアタック感
+    w[i] = DPCM_START_LEVEL + 46 * env * Math.sin(ph) + click;
   }
   return w;
 }

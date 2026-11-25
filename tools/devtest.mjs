@@ -69,7 +69,7 @@ if (opt.rmvpe) {
     const bb = await runBasicPitch(decode(stem('bass'), 1, 22050));
     const note = new Float32Array(bo.note.length), onset = new Float32Array(bo.onset.length);
     for (let i = 0; i < note.length; i++) { note[i] = Math.max(bo.note[i], bb.note[i] || 0); onset[i] = Math.max(bo.onset[i], bb.onset[i] || 0); }
-    bp = { frames: bo.frames, note, onset, inst: bo.note, instOn: bo.onset, bass: bb.note, ms: bo.ms + bb.ms };
+    bp = { frames: bo.frames, note, onset, inst: bo.note, instOn: bo.onset, bass: bb.note, bassOn: bb.onset, ms: bo.ms + bb.ms };
   } else bp = await runBasicPitch(decode(input, 1, 22050));
   console.log(`Basic Pitch: ${opt.dur} 秒を ${(bp.ms / 1000).toFixed(2)} 秒で推論`);
 }
@@ -116,7 +116,7 @@ if (bp) {
     const g = Math.round((t * 22050) / 256);
     if (g < 0 || g >= bp.frames) return null;
     const sl = (a) => (a ? a.subarray(g * 88, g * 88 + 88) : undefined);
-    return { note: sl(bp.note), onset: sl(bp.onset), inst: sl(bp.inst), instOn: sl(bp.instOn), bass: sl(bp.bass) };
+    return { note: sl(bp.note), onset: sl(bp.onset), inst: sl(bp.inst), instOn: sl(bp.instOn), bass: sl(bp.bass), bassOn: sl(bp.bassOn) };
   };
 }
 const t0 = Date.now();
@@ -197,8 +197,8 @@ function writeWav(file, chans) {
   }
   fs.writeFileSync(file, b);
 }
-// 出力は「先読み + 歌用解析窓の半分」だけ遅れているので、元の音と時刻が揃うように詰める
-const delaySamples = Math.round(lag * (SR / 60.0988) + engine.NV / 2);
+// 出力は「先読み + 解析窓の半分」だけ遅れているので、元の音と時刻が揃うように詰める
+const delaySamples = Math.round(lag * (SR / 60.0988) + engine.N / 2);
 const aligned = new Float32Array(n);
 aligned.set(out.subarray(delaySamples));
 writeWav(path.join(opt.out, 'chip.wav'), [aligned]);

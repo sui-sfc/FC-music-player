@@ -14,7 +14,9 @@ export class TempoTracker {
     this.buf = new Float32Array(this.N);
     this.n = 0; // 入れたフレーム数 (= 解析フレームの番号)
     this.period = 0; // 1 拍のフレーム数 (0 = 不明)
-    this.beatRef = 0; // 拍の頭だったフレーム番号
+    this.refFrame = 0; // 基準となる拍のフレーム位置
+    this.refBeat = 0; // refFrame での累積拍番号 (連続・単調増加)
+    this.hasBeat = false;
     this.conf = 0;
   }
   push(o) {
@@ -47,6 +49,7 @@ export class TempoTracker {
     this.conf = Math.max(0, b / ac[0]);
     // 前の推定に近ければなめらかに追従。倍・半分になっただけなら前のテンポのまま (拍の取り方が揺れないように)。
     // それ以外に大きく違うときは、同じ結果が 3 回続いたら切り替える
+    const oldPeriod = this.period;
     const near = (x, y) => Math.abs(x - y) / y < 0.06;
     if (this.period && near(L, this.period)) this.period = this.period * 0.8 + L * 0.2;
     else if (this.period && (near(L, 2 * this.period) || near(L, this.period / 2))) { /* そのまま */ }
@@ -60,11 +63,25 @@ export class TempoTracker {
       for (let k = 0; k < 8; k++) { const i = Math.round(end - 1 - ph - k * P); if (i < end - this.N) break; s += this._at(i) * (1 - k * 0.08); }
       if (s > bs) { bs = s; bp = ph; }
     }
-    this.beatRef = end - 1 - bp;
+    const target = end - 1 - bp;
+    // 基準拍が毎回 1 拍ぶん飛んでベースやアルペジオが途切れないよう、連続な累積拍番号で緩やかに位相追従する
+    if (!this.hasBeat) {
+      this.refFrame = target;
+      this.refBeat = 0;
+      this.hasBeat = true;
+    } else {
+      const approxBeat = this.refBeat + (target - this.refFrame) / (oldPeriod || P);
+      const nearestBeat = Math.round(approxBeat);
+      const predicted = this.refFrame + (nearestBeat - this.refBeat) * P;
+      let err = target - predicted;
+      err -= Math.round(err / P) * P;
+      this.refFrame = predicted + err * 0.25;
+      this.refBeat = nearestBeat;
+    }
   }
   get bpm() { return this.period ? (FPS * 60) / this.period : 0; }
   // フレーム番号 f が何拍目か (小数)。テンポ不明なら null
-  beatAt(f) { return this.period && this.conf > 0.05 ? (f - this.beatRef) / this.period : null; }
+  beatAt(f) { return this.period && this.hasBeat && this.conf > 0.05 ? this.refBeat + (f - this.refFrame) / this.period : null; }
 }
 
 // ---------------- 盛り上がり ----------------

@@ -59,7 +59,7 @@
       <label><input type="checkbox" class="mute" data-ch="0" checked> 矩形波1 (メロディ)
         <select id="duty1"><option value="0">12.5%</option><option value="1" selected>25%</option><option value="2">50%</option><option value="3">75%</option></select></label>
       <label><input type="checkbox" class="mute" data-ch="1" checked> 矩形波2 (ハモリ)
-        <select id="duty2"><option value="0">12.5%</option><option value="1" selected>25%</option><option value="2">50%</option><option value="3">75%</option></select></label>
+        <select id="duty2"><option value="0" selected>12.5%</option><option value="1">25%</option><option value="2">50%</option><option value="3">75%</option></select></label>
       <label><input type="checkbox" class="mute" data-ch="2" checked> 三角波 (ベース)
         <select id="bassOctave"><option value="-1">-1oct</option><option value="0" selected>±0</option><option value="1">+1oct</option></select>
         <select id="bassPattern"><option value="oct" selected>8 分でオクターブ跳躍</option><option value="8th">8 分で刻む</option><option value="follow">原曲どおり</option></select></label>
@@ -96,7 +96,7 @@
       <label>音の落ち着き <input id="noteCost" type="range" min="0.3" max="4" step="0.1" value="1.5"></label>
       <label>出だしの強さ <input id="accent" type="range" min="0" max="5" step="1" value="1"></label>
       <label>音の減衰 <input id="decay" type="range" min="0" max="0.9" step="0.05" value="0.5"></label>
-      <label>出だしのしゃくり <input id="attackBend" type="range" min="0" max="2" step="0.25" value="0.5"></label>
+      <label>出だしのしゃくり <input id="attackBend" type="range" min="0" max="2" step="0.25" value="0"></label>
       <label>出だしの音色 <select id="dutyEnv">
         <option value="pluck" selected>太く (最初だけ 50%)</option>
         <option value="thin">鋭く (最初だけ 12.5%)</option>
@@ -111,7 +111,7 @@
         <option value="harm">ハモリ</option>
         <option value="echo">メロディのエコー</option>
       </select></label>
-      <label>矩形波2 の音量 <input id="harmVol" type="range" min="0" max="1.2" step="0.05" value="0.8"></label>
+      <label>矩形波2 の音量 <input id="harmVol" type="range" min="0" max="1.2" step="0.05" value="0.65"></label>
       <label>楽器の旋律の落ち着き <input id="instCost" type="range" min="0.5" max="6" step="0.5" value="2.5"></label>
       <label>アルペジオの速さ <select id="arpRate">
         <option value="16">16 分音符 (テンポに合わせる)</option>

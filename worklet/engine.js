@@ -52,6 +52,7 @@ export class Engine {
     this.N = sr > 60000 ? 16384 : 8192;
     this.ringL = new Float32Array(this.N);
     this.ringR = new Float32Array(this.N);
+    this.ringMix = new Float32Array(this.N); // 原曲モノラル (解析窓の中心で RMS を測るため)
     // 音源分離 (Demucs) の結果を使うときの入力: 歌 L/R・ドラム (stems = true のとき)
     this.stems = false;
     this.ringVL = new Float32Array(this.N);
@@ -119,7 +120,7 @@ export class Engine {
     this.batchL = new Float32Array(2048); this.batchR = new Float32Array(2048); this.batchN = 0;
     this.tmpOut = new Float32Array(1024);
     // 時刻の基準を分離側とそろえるため、解析をやり直す
-    this.inCount = 0; this.frameAcc = 0; this.ringL.fill(0); this.ringR.fill(0);
+    this.inCount = 0; this.frameAcc = 0; this.ringL.fill(0); this.ringR.fill(0); this.ringMix.fill(0);
     this.driver.reset();
     this.extK.fill(-1); this.bpK.fill(-1);
     const slot = (k) => ((k % 1000) + 1000) % 1000;
@@ -128,7 +129,8 @@ export class Engine {
       const k = Math.round(t * 100), i = slot(k);
       return k >= 0 && this.bfK[i] === k ? { f0: this.bfF0[i], conf: this.bfConf[i] } : null;
     };
-    this.bpInst = new Float32Array(1000 * BP_NOTES); this.bpInstOn = new Float32Array(1000 * BP_NOTES); this.bpBass = new Float32Array(1000 * BP_NOTES);
+    this.bpInst = new Float32Array(1000 * BP_NOTES); this.bpInstOn = new Float32Array(1000 * BP_NOTES);
+    this.bpBass = new Float32Array(1000 * BP_NOTES); this.bpBassOn = new Float32Array(1000 * BP_NOTES);
     port.postMessage({ type: 'reset', sr });
     port.onmessage = (e) => this._onStems(e.data);
     this.driver.extLookup = (t) => {
@@ -141,7 +143,7 @@ export class Engine {
         const i = slot(k);
         if (k >= 0 && this.bpK[i] === k) {
           const sl = (a) => a.subarray(i * BP_NOTES, (i + 1) * BP_NOTES);
-          return { note: sl(this.bpNote), onset: sl(this.bpOnset), inst: sl(this.bpInst), instOn: sl(this.bpInstOn), bass: sl(this.bpBass) };
+          return { note: sl(this.bpNote), onset: sl(this.bpOnset), inst: sl(this.bpInst), instOn: sl(this.bpInstOn), bass: sl(this.bpBass), bassOn: sl(this.bpBassOn) };
         }
       }
       return null;
@@ -184,7 +186,7 @@ export class Engine {
       this.bpK[i] = k;
       for (let q = 0; q < NB; q++) {
         const a = g * NB + q, b = i * NB + q;
-        this.bpInst[b] = bp.note[a]; this.bpInstOn[b] = bp.onset[a]; this.bpBass[b] = bp.bass[a];
+        this.bpInst[b] = bp.note[a]; this.bpInstOn[b] = bp.onset[a]; this.bpBass[b] = bp.bass[a]; this.bpBassOn[b] = bp.bassOn[a];
         this.bpNote[b] = Math.max(bp.note[a], bp.bass[a]);
         this.bpOnset[b] = Math.max(bp.onset[a], bp.bassOn[a]);
       }
@@ -292,9 +294,10 @@ export class Engine {
     }
   }
 
-  // 直近 N サンプルの L/R から、全体の振幅 (mixOut) と中央成分の振幅 (centerOut) を求める
+  // 解析窓の中心 (pos - N/2) を揃えて、全体の振幅 (mixOut) と中央成分の振幅 (centerOut) を求める
+  // 長窓 (this.N) と短窓 (this.NV) の中心時刻が一致するので、ドラム・歌・コード・AI 解析・原音遅延がズレない
   _spectrum(N, fft, win, re, im, mixOut, centerOut, rL = this.ringL, rR = this.ringR) {
-    const RN = this.N, off = this.pos + RN - N;
+    const RN = this.N, off = this.pos + RN - ((RN + N) >> 1);
     // L を実部・R を虚部に入れて 1 回の FFT で両チャンネルを求める
     for (let i = 0; i < N; i++) {
       const j = (off + i) % RN;
@@ -332,14 +335,20 @@ export class Engine {
       this._spectrum(this.NV, this.fftV, this.winV, this.reV, this.imV, this.ampVmix, null, this.ringD, this.ringD);
     } else this._spectrum(this.NV, this.fftV, this.winV, this.reV, this.imV, this.ampVmix, this.ampV);
 
-    const c = this.cnt || 1;
-    const bands = [this.bandE[0] / c, this.bandE[1] / c, this.bandE[2] / c];
-    const rms = Math.sqrt(this.sq / c);
+    // RMS も解析窓の中心 (pos - N/2) の 1 フレームぶんで測り、フレーズ末尾の早切れを防ぐ
+    const fl = Math.max(1, Math.round(this.frameLen));
+    const RN = this.N, rOff = this.pos + RN - ((RN + fl) >> 1);
+    let sq = 0;
+    for (let i = 0; i < fl; i++) {
+      const s = this.ringMix[(rOff + i) % RN];
+      sq += s * s;
+    }
+    const rms = Math.sqrt(sq / fl);
     this.bandE[0] = this.bandE[1] = this.bandE[2] = 0;
     this.sq = 0;
     this.cnt = 0;
 
-    const time = (this.inCount - this.NV / 2) / (this.frameLen * 60.0988);
+    const time = (this.inCount - this.N / 2) / this.sr;
     const info = this.driver.frame(this.amp, this.ampV, this.ampVmix, rms, time);
     info.rms = rms;
     this.onFrame(info, this);
@@ -369,6 +378,7 @@ export class Engine {
       const x = (l + r) / 2;
       this.ringL[this.pos] = specL ? specL[i] : l;
       this.ringR[this.pos] = specR ? specR[i] : r;
+      this.ringMix[this.pos] = x;
       this.pos = (this.pos + 1) % this.N;
       const bl = runBq(bq[0], x), bm = runBq(bq[1], x), bh = runBq(bq[2], x);
       this.bandE[0] += bl * bl; this.bandE[1] += bm * bm; this.bandE[2] += bh * bh;

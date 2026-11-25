@@ -15,7 +15,7 @@
 import { CPU_CLOCK } from './apu.js';
 import { viterbiFirst } from './viterbi.js';
 import { chromaFrom, chordEmits, decideChord, chordName, chordRoot, chordIntervals, N_CHORDS } from './chords.js';
-import { DrumDetector, DRUM_DELAY } from './drums.js';
+import { DrumDetector, DRUM_DELAY, ONSET_DELAY } from './drums.js';
 import { BP_MIDI0 } from './basicpitch.js';
 import { buildDrumBank, DPCM_START_LEVEL } from './dpcm.js';
 import { TempoTracker, EnergyTracker, arpTone } from './arranger.js';
@@ -171,7 +171,7 @@ const DRUMS_LAYER = {
 
 export const DEFAULT_PARAMS = {
   duty1: 1, // 25% (聴き比べで 50% より歌らしいと判断)
-  duty2: 1, // 25%
+  duty2: 0, // 12.5% (矩形波 1 と音色を分けてメロディを立たせる)
   mute: [false, false, false, false], // P1, P2, Tri, Noise
   p2mode: 'auto', // 矩形波2: 'auto' 盛り上がりで切替 (静か = 楽器の旋律を控えめに, 普通 = 楽器の旋律, サビ = 拍に合わせたアルペジオ) / 'inst' 楽器の旋律 / 'arp' コードのアルペジオ / 'harm' ハモリ / 'echo' メロディのエコー
   instThr: 0.2, // 楽器の音として拾う Basic Pitch の確率の下限
@@ -182,7 +182,7 @@ export const DEFAULT_PARAMS = {
   arpPattern: 'updown', // アルペジオの音型: 'up' / 'down' / 'updown' (1-3-5-3) / 'up8' (1-3-5-8)
   quietDb: -9, // 盛り上がりの判定: 曲の大きい所よりこれだけ小さいと「静か」
   loudDb: -1.5, // 歌の大きさがこれまでで一番大きい所からこの範囲内なら「サビ」
-  attackBend: 0.5, // 音の出だしで上からしゃくり下ろす幅 (半音, 0 = しない)
+  attackBend: 0, // 音の出だしで上からしゃくり下ろす幅 (半音, 0 = しない。歌モノでは上ずりを防ぐため既定 0)
   dutyEnv: 'pluck', // 音の出だしのデューティ比: 'pluck' 最初の 2 フレームを 50% (太く) / 'thin' 12.5% (鋭く) / 'off'
   release: 4, // 音の終わりに 12.5% で小さく残す長さ (フレーム, 0 = すぐ切る)
   arpLow: 62, // アルペジオの最低音 (D4)
@@ -198,7 +198,7 @@ export const DEFAULT_PARAMS = {
   drumVol: 1.0,
   drumMode: 'dpcm', // 'dpcm' キック・スネアを DPCM サンプルで / 'noise' ノイズと三角波だけで
   melodyVol: 1.0,
-  harmVol: 0.8,
+  harmVol: 0.65,
   vocal: true, // ボーカルモード: ステレオ中央成分からメロディを追跡
   melOctave: '0', // (聴き比べで、上げない方が自然と判断)  メロディのオクターブ: 'auto' 歌が低ければ 1 オクターブ上げる / -1 / 0 / 1
   lead: true, // 歌の無い区間はリード楽器を矩形波1で鳴らす
@@ -263,6 +263,7 @@ export class Driver {
     this.tempo = new TempoTracker(); // ドラムの立ち上がりからテンポと拍の位置
     this.energy = new EnergyTracker(); // 曲の盛り上がり
     this.level = 1; // 0 = 静か, 1 = 普通, 2 = サビ
+    this.prevBeatInt = null;
     this.anaN = 0; // 解析したフレーム数
     this.relLeft = 0; this.relVol = 0; this.prevV1 = 0; // 矩形波1 の音の終わり (リリース)
     // メロディ
@@ -271,6 +272,8 @@ export class Driver {
     this.noteCenter = -1; // 音符の中心音程 (ビブラートを除いた音程)
     this.melAge = 0; // 今の音符が始まってからのフレーム数
     this.chipNote = -1; // chip モードで鳴らしている音
+    this.notePeak = 0;
+    this.melSalMin = 1; this.prevMelSal = 0; // 同音連打 (再発音) の検出用
     this.melHist = []; // エコー用の履歴
     this.octUp = false; // 1 オクターブ上げているか (auto のとき)
     this.vocalGap = 999; // 歌が途切れてからのフレーム数
@@ -281,6 +284,7 @@ export class Driver {
     this.chordId = -1;
     this.bassState = -1;
     this.bassAge = 0;
+    this.bassE8 = undefined;
     this.mel.reset(); this.har.reset();
     this.frameNo = 0;
     this.vol = [0, 0];
@@ -350,7 +354,9 @@ export class Driver {
     // 1 オクターブ下の可能性も候補に入れる (歌の奇数倍音が伴奏に埋もれると 1 オクターブ上に見えるため)
     const pool = cands.slice(0, 6).filter((c) => c.s >= 0.2 * top);
     for (const c of pool.slice(0, 3)) {
-      if (c.note - 12 >= VOCAL_LO) pool.push({ note: c.note - 12, s: c.s * 0.7, m: c.m - 12, motion: c.motion });
+      if (c.note - 12 >= VOCAL_LO && !pool.some((p) => p.note === c.note - 12)) {
+        pool.push({ note: c.note - 12, s: c.s * 0.7, m: c.m - 12, motion: c.motion });
+      }
     }
     return pool.map((c) => {
       const vib = 1 + 1.5 * Math.min(1, c.motion / 0.12);
@@ -465,6 +471,9 @@ export class Driver {
         const p = note[m - BP_MIDI0];
         if (p >= 0.25 && p >= 0.4 * mx) out.push({ m, e: Math.log(p) });
       }
+    } else if (rec.bassPeaks && rec.bassPeaks.length) {
+      // 内蔵解析でも複数候補をビタビに渡すことで、キック通過時の 1〜2 フレームの揺れや音欠けを防ぐ
+      for (const bp of rec.bassPeaks) out.push({ m: bp.note, e: Math.log(Math.max(bp.p, 0.05)) });
     } else if (rec.bassN >= 0) out.push({ m: rec.bassN, e: Math.log(0.5) });
     if (rec.bassF0 > 0 && rec.bassConf >= P.bassF0Thr) {
       const m = Math.round(freqToMidi(rec.bassF0));
@@ -515,16 +524,29 @@ export class Driver {
     const top = picks.length ? picks[0].s : 0;
     const vol = (s) => clamp(Math.round(15 * Math.sqrt(s / this.agc)), 0, 15);
 
-    // ベース (内蔵推定。Basic Pitch が無いときに使う)
+    // ベース (内蔵推定。Basic Pitch が無いときに使う。低域の上位候補も保持してビタビを安定させる)
     let bassN = -1;
     for (const p of picks) if (p.note <= 55 && p.s >= 0.12 * top && (bassN < 0 || p.note < bassN)) bassN = p.note;
-    if (bassN < 0 && gate) {
-      let bn = -1, bv = 0;
-      for (let n = NOTE_LO; n <= 52; n++) if (A.s(n) > bv) { bv = A.s(n); bn = n; }
-      if (bn >= 0 && bv >= 0.25 * smax) bassN = bn;
+    const bassPeaks = [];
+    if (gate) {
+      let bmax = 0;
+      for (let n = NOTE_LO; n <= 55; n++) if (A.s(n) > bmax) bmax = A.s(n);
+      if (bmax >= 0.12 * smax) {
+        const raw = [];
+        for (let n = NOTE_LO; n <= 55; n++) {
+          const s = A.s(n);
+          if (s >= 0.45 * bmax && s >= 0.08 * smax && s >= A.s(n - 1) && s >= A.s(n + 1)) raw.push({ note: n, s });
+        }
+        raw.sort((a, b) => b.s - a.s);
+        for (const r of raw) {
+          if (bassPeaks.length >= 4) break;
+          bassPeaks.push({ note: r.note, p: 0.7 * (r.s / bmax) });
+        }
+        if (bassN < 0 && bmax >= 0.25 * smax && bassPeaks.length) bassN = bassPeaks[0].note;
+      }
     }
 
-    const rec = { gate, bassN, picks, cands: [], mel: -1, melPitch: -1, melVol: 0, hit: null, time, ext: false, bpDone: false };
+    const rec = { gate, bassN, bassPeaks, picks, cands: [], mel: -1, melPitch: -1, melVol: 0, hit: null, time, ext: false, bpDone: false };
     // コード認識用のクロマ (内蔵推定)
     rec.chromaS = gate ? chromaFrom((m) => (m >= NOTE_LO && m <= NOTE_HI ? Math.min(1, A.s(m) / this.agc) : 0)) : { chroma: new Float64Array(12), total: 0 };
     rec.pickVol = new Map(picks.map((p) => [p.note, vol(p.s)]));
@@ -564,11 +586,19 @@ export class Driver {
     this.frameNo++;
     for (const rec of q) this._attach(rec);
     // 曲の盛り上がり (静か / 普通 / サビ) と、今が何拍目か
-    if (r.rms !== undefined) this.level = this.energy.update(r, q.slice(1), P);
-    const beat = r.fi !== undefined ? this.tempo.beatAt(r.fi + DRUM_DELAY) : null;
+    const beat = r.fi !== undefined ? this.tempo.beatAt(r.fi + ONSET_DELAY) : null;
+    const beatInt = beat !== null ? Math.floor(beat) : null;
+    if (r.rms !== undefined) {
+      const wantLevel = this.energy.update(r, q.slice(1), P);
+      // テンポが分かっているときは拍の頭で場面を切り替える (小節の途中で唐突にアルペジオが始まらないように)
+      if (wantLevel !== this.level && (beatInt === null || this.prevBeatInt === null || beatInt !== this.prevBeatInt)) {
+        this.level = wantLevel;
+      }
+    }
+    this.prevBeatInt = beatInt;
 
     // ---------------- メロディ ----------------
-    let mel = -1, melPitch = -1, target = 0;
+    let mel = -1, melPitch = -1, target = 0, melSal = 0;
     const trans = (a, b) => {
       if (a < 0 && b < 0) return 0;
       if (a < 0 || b < 0) return -1.2;
@@ -585,12 +615,14 @@ export class Driver {
         // 確定した経路を軽く平滑化 (ビブラートは残し、細かいブレだけ取る)
         this.vOut = this.vOut >= 0 && Math.abs(m - this.vOut) <= 1 ? this.vOut + (m - this.vOut) * 0.7 : m;
         melPitch = this.vOut;
-        target = clamp(Math.round(15 * Math.sqrt(r.cands[j].s) * P.melodyVol), 0, 15);
+        melSal = r.cands[j].s;
+        target = clamp(Math.round(15 * Math.sqrt(melSal) * P.melodyVol), 0, 15);
         this.center += (melPitch - this.center) * 0.008; // 声域の中心をゆっくり追従
       } else this.vOut = -1;
     } else if (r.mel >= 0) {
       melPitch = r.melPitch;
       target = Math.round(r.melVol * P.melodyVol);
+      melSal = r.melVol / 15;
     }
 
     let isLead = false;
@@ -623,14 +655,15 @@ export class Driver {
         // 息継ぎ程度の短い隙間 (0.3 秒未満) は埋めない
         if (melPitch < 0 && this.vocalGap > 20 && this.leadState >= 0) {
           melPitch = this.leadState;
-          target = clamp(Math.round(15 * Math.sqrt(r.leadC[lj].p) * P.melodyVol * 0.9), 0, 15);
+          melSal = r.leadC[lj].p;
+          target = clamp(Math.round(15 * Math.sqrt(melSal) * P.melodyVol * 0.9), 0, 15);
           isLead = true;
         }
       }
     }
 
     // 音程の整え方: 音符の中心を半音に合わせ、ビブラート (中心からのズレ) は残す
-    let newNote = false;
+    let newNote = false, reArtic = false;
     // 16 分音符の区切り (メロディの切り替えを拍に揃えるとき用)
     const q16 = beat !== null ? Math.floor(beat * 4) : null;
     if (melPitch >= 0 && P.pitchMode === 'chip') {
@@ -639,19 +672,35 @@ export class Driver {
       // 伸ばした音にだけ、決まった深さ・速さのビブラートを後からかける (チップチューンの定番)
       const n = Math.round(melPitch);
       const shift = isLead ? 0 : this.phraseShift || 0;
-      const future = (x) => {
-        const c = isLead ? x.leadC && x.leadC[0] : x.cands[0];
-        return c ? Math.round(c.m + shift) : -99;
+      // 先読みフレームに音程 n の候補があるか (cands[0] だけでなくビタビが選び得る上位候補も確認)
+      const futureHas = (x) => {
+        const list = isLead ? x.leadC : x.cands;
+        if (!list || !list.length) return false;
+        const bestE = list[0].e;
+        for (const c of list) if (c.e >= bestE - 1.5 && Math.round(c.m + shift) === n) return true;
+        return false;
       };
       if (this.chipNote < 0) { this.chipNote = n; newNote = true; this.melAge = 0; }
       else if (n !== this.chipNote && !(P.melQuant && this.q16 !== null && q16 === this.q16)) {
         let keep = 0;
         const K = Math.min(P.minNote, q.length - 1);
-        for (let i = 1; i <= K; i++) if (Math.abs(future(q[i]) - n) <= 0) keep++;
+        for (let i = 1; i <= K; i++) if (futureHas(q[i])) keep++;
         if (keep >= K - 1) { this.chipNote = n; newNote = true; this.melAge = 0; }
       }
       this.q16 = q16;
       this.melAge++;
+      // 同音連打 (同じ音程で言葉を刻む歌・連打リフ) を検出して発音を区切る
+      if (!newNote) {
+        if (isLead && r.bp) {
+          const ons = r.bp.instOn || r.bp.onset;
+          if (ons && this.chipNote >= BP_MIDI0 && this.chipNote < BP_MIDI0 + 88 && ons[this.chipNote - BP_MIDI0] > 0.45 && this.melAge >= 6) {
+            reArtic = true;
+          }
+        } else if (this.melAge >= 8 && melSal > 0.12 && melSal > this.melSalMin * 1.4 && melSal > this.prevMelSal * 1.05) {
+          reArtic = true;
+        }
+        if (reArtic) this.melAge = 1;
+      }
       const a = this.melAge - P.vibDelay;
       const vib = a > 0 ? P.vibDepth * Math.min(1, a / 15) * Math.sin((2 * Math.PI * a) / P.vibPeriod) : 0;
       melPitch = this.chipNote + vib;
@@ -667,14 +716,26 @@ export class Driver {
       else if (P.pitchMode === 'snap') melPitch = snapped;
       mel = Math.round(melPitch);
       this.melAge++;
-    } else { this.noteCenter = -1; this.chipNote = -1; }
+      if (!newNote && this.melAge >= 8 && melSal > 0.12 && melSal > this.melSalMin * 1.4 && melSal > this.prevMelSal * 1.05) {
+        reArtic = true;
+        this.melAge = 1;
+      }
+    } else { this.noteCenter = -1; this.chipNote = -1; this.melSalMin = 1; this.prevMelSal = 0; }
+
+    // 同音連打の検出用に、現在の音符中での最小強さを追跡
+    if (mel >= 0) {
+      if (newNote || reArtic) this.melSalMin = melSal;
+      else if (this.melAge >= 2 && melSal < this.melSalMin) this.melSalMin = melSal;
+      this.prevMelSal = melSal;
+    }
 
     // 音量: 1 音ごとに「出だしが最大 → 約 0.3 秒かけて減衰」(参考アレンジの音符の平均的な形)。
     // 1 音ずつ鳴らし直すことで、レガートな歌でもファミコンらしい粒立ちになる
     let v1 = 0;
     if (mel >= 0) {
-      if (newNote) this.notePeak = Math.max(target, 4);
-      else this.notePeak = Math.max(this.notePeak, target * 0.8); // 途中で強くなったら少し追従
+      if (newNote || reArtic) this.notePeak = Math.max(target, 5);
+      else if (target > this.notePeak) this.notePeak = Math.max(this.notePeak, target * 0.85);
+      else this.notePeak = this.notePeak * 0.97 + target * 0.03; // 伸ばした音の自然なデクレッシェンドに緩やかに追従
       const env = 1 - P.decay + P.decay * Math.exp(-(this.melAge - 1) / 10);
       v1 = clamp(Math.round(Math.min(15, this.notePeak + P.accent) * env), 1, 15);
     }
@@ -683,7 +744,7 @@ export class Driver {
     let duty1 = P.duty1;
     if (mel >= 0) {
       this.relLeft = 0;
-      if (P.attackBend && this.melAge <= 3) melPitch += P.attackBend * [1, 0.5, 0.25][this.melAge - 1];
+      if (P.attackBend && !reArtic && this.melAge <= 3) melPitch += P.attackBend * [1, 0.5, 0.25][this.melAge - 1];
       if (this.melAge <= 2 && P.dutyEnv === 'pluck') duty1 = 2;
       else if (this.melAge <= 2 && P.dutyEnv === 'thin') duty1 = 0;
     } else if (P.release > 0) {
@@ -744,9 +805,9 @@ export class Driver {
       }
       this.instState = m;
       if (m < 0) this.instAge = 0;
-      // AI 解析 (Basic Pitch) が無いときは、コードの構成音を 1 つ伸ばすだけにする
-      // 楽器の旋律が見つからない所も同じ (無音にすると隙間が目立つので、静かに伸ばす)
-      if (h2 < 0 && hasChord && r.gate && P.instPad && p2gain === 1) {
+      // AI 解析 (Basic Pitch) が無いときや楽器が見つからない所は、コードの構成音を静かに伸ばす
+      // (静かな場面でも p2gain で控えめになるので、無音にしてスカスカにしない)
+      if (h2 < 0 && hasChord && r.gate && P.instPad) {
         const root = 60 + chordRoot(chordId);
         let tones = chordIntervals(chordId).map((d) => root + d);
         // 歌と半音・同じ音でぶつからない構成音だけ使う
@@ -769,8 +830,10 @@ export class Driver {
         const root = P.arpLow + ((chordRoot(chordId) - (P.arpLow % 12) + 12) % 12);
         let tones = chordIntervals(chordId).map((d) => root + d);
         if (tones.length === 2) tones.push(root + 12); // パワーコードはオクターブを足して 3 音に
-        // 歌より上に出るとメロディが埋もれるので、歌より上の音は 1 オクターブ下げる
-        if (mel >= 0 && P.p2mode === 'auto') tones = tones.map((t) => (t > mel - 2 ? t - 12 : t)).sort((a, b) => a - b);
+        // 歌より上に出るとメロディが埋もれるので、和音全体を 1 オクターブ下げて転回形の乱れを防ぐ
+        if (mel >= 0 && P.p2mode === 'auto' && tones[tones.length - 1] > mel - 2 && tones[0] - 12 >= 48) {
+          tones = tones.map((t) => t - 12);
+        }
         const a = arpTone(tones, P.arpPattern, P.arpRate, beat, this.frameNo, P.arpSpeed);
         h2 = a.note;
         const e = Math.sqrt(Math.min(1, (r.chordTotal || 0) / this.agcChord));
@@ -808,11 +871,14 @@ export class Driver {
     if (r.hit) {
       const useDpcm = P.drumMode === 'dpcm' && (r.hit === 'kick' || r.hit === 'snare') && !P.mute[3];
       if (useDpcm) dmcHit = r.hit;
-      const d = useDpcm ? DRUMS_LAYER[r.hit] : DRUMS[r.hit];
+      // DPCM キックと同時にハイハットが鳴っているときは、ノイズ側でハイハットを重ねる (実機定番の分担)
+      const noiseHit = useDpcm && r.hit === 'kick' && r.hat ? 'hat' : r.hit;
+      const d = useDpcm && noiseHit !== 'hat' ? DRUMS_LAYER[r.hit] : DRUMS[noiseHit];
       const curD = this.drum && this.drumPos < this.drum.seq.length ? this.drum : null;
       if (!curD || d.pri >= curD.pri || this.drumPos >= 2) {
-        this.drum = d; this.drumPos = 0; this.drumName = r.hit;
-        this.drumGain = 0.55 + 0.45 * (r.hitStrength ?? 1); // 強く叩いたものほど大きく
+        this.drum = d; this.drumPos = 0; this.drumName = noiseHit;
+        const st = noiseHit === 'hat' && r.hit === 'kick' ? (r.hatStrength ?? 0.8) : (r.hitStrength ?? 1);
+        this.drumGain = 0.55 + 0.45 * st; // 強く叩いたものほど大きく
       }
     }
     let nIdx = this.regs[14] & 15, nVol = 0, drumName = '';
@@ -838,7 +904,7 @@ export class Driver {
       this.write(0x4015, 0x0f);
       this.write(0x4015, 0x1f);
       this.mask |= 16;
-      drumName = dmcHit;
+      if (!drumName) drumName = dmcHit;
     }
 
     // ---------------- 三角波 (ベース / キック) ----------------
@@ -847,9 +913,11 @@ export class Driver {
     const btrans = (a, b) => (a === b ? 0 : a < 0 || b < 0 ? -0.8 : -P.bassCost);
     const bj = viterbiFirst(bstates, bemits, this.bassState, btrans);
     const bass = r.gate ? bstates[0][bj] : -1;
-    // 同じ音を弾き直したところ (Basic Pitch の立ち上がり) は 1 フレーム切って発音を区切る
+    const use8th = P.bassPattern !== 'follow' && beat !== null && this.level >= 1;
+    // 同じ音を弾き直したところ (Basic Pitch の立ち上がり) は 1 フレーム切って発音を区切る (8 分刻み時は二重カットしない)
     let retrig = false;
-    if (bass >= 0 && bass === this.bassState && r.bp && r.bp.onset[bass - BP_MIDI0] > 0.5 && this.bassAge > 6) retrig = true;
+    const bassOn = r.bp && (r.bp.bassOn || r.bp.onset);
+    if (!use8th && bass >= 0 && bass === this.bassState && bassOn && bassOn[bass - BP_MIDI0] > 0.5 && this.bassAge > 6) retrig = true;
     this.bassAge = bass === this.bassState && !retrig ? this.bassAge + 1 : 0;
     this.bassState = bass;
 
@@ -859,10 +927,10 @@ export class Driver {
       if (kickTriFreq) f = kickTriFreq;
       else if (bass >= 0 && !retrig) {
         triNote = bass + 12 * P.bassOctave;
-        // 8 分音符で刻む: 拍の頭で 1 フレーム切って弾き直す。'oct' は裏拍を 1 オクターブ上に
-        if (P.bassPattern !== 'follow' && beat !== null && this.level >= 1) {
+        // 8 分音符で刻む: 拍の頭で 1 フレーム切って弾き直す。'oct' は裏拍を 1 オクターブ上に (高すぎて歌と被らない範囲で)
+        if (use8th) {
           const e8 = Math.floor(beat * 2);
-          if (P.bassPattern === 'oct' && e8 % 2) triNote += 12;
+          if (P.bassPattern === 'oct' && (e8 & 1) && triNote <= 48) triNote += 12;
           if (this.bassE8 !== undefined && e8 !== this.bassE8) triNote = -2; // 区切り
           this.bassE8 = e8;
         }
@@ -902,7 +970,7 @@ export class Driver {
   }
 
   // amp: 振幅スペクトル (長窓), ampV: 中央成分スペクトル (短窓), ampVmix: 全体スペクトル (短窓),
-  // rms: 入力 RMS, time: 歌用解析窓の中心時刻 (秒。外部推定の結果と突き合わせるのに使う)
+  // rms: 入力 RMS, time: 解析窓の中心時刻 (秒。外部推定の結果と突き合わせるのに使う)
   // 戻り値: このフレームで出力したチャンネル情報 (先読みが溜まるまでは無音のフレーム)
   frame(amp, ampV, ampVmix, rms, time = 0) {
     const P = this.params;
@@ -915,9 +983,9 @@ export class Driver {
     this.queue.push(rec);
     // ドラムは数フレーム遅れて判定が出るので、該当フレームに書き込む
     const d = this.drums.push(ampVmix, P.drumSens);
-    this.tempo.push(this.drums.onset || 0); // 立ち上がりの強さ (テンポ推定用。DRUM_DELAY フレーム前のもの)
+    this.tempo.push(this.drums.onset || 0); // 立ち上がりの強さ (テンポ推定用。ONSET_DELAY フレーム前のもの)
     const target = this.queue[this.queue.length - 1 - DRUM_DELAY];
-    if (d && target) { target.hit = d.hit; target.hitStrength = d.strength; }
+    if (d && target) { target.hit = d.hit; target.hitStrength = d.strength; target.hat = d.hat; target.hatStrength = d.hatStrength; }
     // 先読みフレーム数が減らされた場合は溜まった分を出力して追いつく
     while (this.queue.length > L + 1) { this._render(this.queue[0], this.queue); this.queue.shift(); }
     if (this.queue.length <= L) return this._render(SILENT, [SILENT]);
